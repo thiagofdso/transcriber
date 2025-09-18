@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "transcription-library"
+version = "0.1.0"
+authors = [
+    { name="Your Name", email="your.email@example.com" },
+]
+description = "A pluggable Python library for audio and video transcription using various AI models (Distil-Whisper, Faster-Whisper, Gemini)."
+readme = "README.md"
+requires-python = ">=3.8"
+keywords = ["transcription", "audio", "video", "whisper", "gemini", "ai"]
+license = { file="LICENSE" }
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+    "Topic :: Multimedia :: Video",
+]
+
+dependencies = [
+    "transformers>=4.30.0",
+    "torch>=1.12.0",
+    "faster-whisper>=0.10.0",
+    "google-generativeai>=0.3.0",
+    "numba>=0.57.0",
+    "tqdm>=4.64.0",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/YourUsername/transcription-library"
+"Bug Tracker" = "https://github.com/YourUsername/transcription-library/issues"
+"Source" = "https://github.com/YourUsername/transcription-library"
+
+[tool.setuptools.packages.find]
+where = ["."]

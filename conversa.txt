@@ -1,0 +1,1795 @@
+Pergunta: Anexei os códigos que uso em dois projetos meus para transcrição de vídeo, quero criar uma biblioteca para usar fazer a transcrição de forma mais plugável, usando principios de componetização como se fosse um plugin, elabore um plano detalhado de como fazer isso, a principio quero usar somente o distilwhisper para isso.
+Resposta: Que excelente iniciativa! Transformar seus códigos de transcrição em uma biblioteca plugável é um passo fundamental para aumentar a modularidade, a reutilização e a manutenibilidade do seu projeto. A abordagem de \"plugin\" permitirá que você adicione ou troque facilmente os modelos de transcrição no futuro, sem reescrever grande parte da sua lógica central.
+
+Vamos elaborar um plano detalhado para criar essa biblioteca, focando inicialmente no Distil-Whisper, conforme sua solicitação.
+
+---
+
+## Plano Detalhado: Criando uma Biblioteca de Transcrição Pluggável com Distil-Whisper
+
+O objetivo é construir uma biblioteca onde diferentes motores de transcrição (como Distil-Whisper, Faster-Whisper, Gemini, etc.) possam ser \"plugados\" facilmente. Isso envolve definir contratos claros (interfaces), encapsular a lógica específica de cada motor em componentes separados e criar um gerenciador que orquestra a seleção e execução desses componentes.
+
+### 1. Entendimento do Estado Atual e Requisitos
+
+Seus arquivos `transcription.txt` (que contém o `processor_hybrid.py`) e `transcriber.py` (que contém o `Transcriber` para Faster-Whisper) já oferecem uma base sólida.
+
+*   **`processor_hybrid.py` (do seu `transcription.txt`):**
+    *   Possui a classe `DistilWhisperProcessor`, que é o nosso foco principal. Ela já lida com o carregamento do modelo, execução do pipeline e extração de resultados, inclusive com cache e cálculo de confiança.
+    *   Tem o `HybridAIProcessor` que orquestra o Distil-Whisper como primário e Faster-Whisper/Gemini como fallback. Essa lógica de fallback será importante para o nosso gerenciador.
+    *   Inclui o `GeminiVideoProcessor` para transcrição de vídeo via Gemini, que pode ser um plugin futuro.
+    *   Contém estruturas de dados como `TranscriptionResult` que podemos reutilizar.
+    *   Usa `asyncio` e `run_in_executor` para operações não bloqueantes.
+    *   Possui funções utilitárias como `_get_file_hash`, `_get_audio_duration`, `_calculate_confidence`, `_extract_segments`.
+
+*   **`transcriber.py`:**
+    *   Implementa o `Transcriber` usando `faster-whisper`.
+    *   Gerencia a configuração do ambiente CUDA (`setup_cuda_environment`).
+    *   Possui lógica para salvar transcrições em TXT e SRT.
+
+**Requisito Principal:** Começar com o Distil-Whisper de forma plugável.
+
+### 2. Princípios de Arquitetura para Pluggabilidade
+
+Para alcançar a pluggabilidade, seguiremos os seguintes princípios:
+
+*   **Separação de Preocupações (Separation of Concerns):** Cada parte do sistema deve ser responsável por uma única funcionalidade. A lógica de transcrição do Distil-Whisper deve viver em seu próprio módulo, separada da lógica de seleção ou gerenciamento.
+*   **Inversão de Dependência (Dependency Inversion Principle - DIP):** Módulos de alto nível não devem depender de módulos de baixo nível. Ambos devem depender de abstrações. Isso significa que nosso gerenciador de transcrição dependerá de uma interface (`ITranscriptionProvider`), não de uma implementação concreta como `DistilWhisperProvider`.
+*   **Interface Segregation Principle (ISP):** Clientes não devem ser forçados a depender de interfaces que não usam. Nossa interface será focada puramente em transcrição.
+*   **Encapsulamento:** Esconder os detalhes de implementação de cada provedor de transcrição. O gerenciador não precisa saber como o Distil-Whisper carrega seu modelo ou processa o áudio, apenas que ele pode transcrever.
+*   **Configurabilidade:** A capacidade de configurar e alternar provedores sem alterar o código-fonte.
+
+### 3. Estrutura da Biblioteca Proposta
+
+Vamos organizar o projeto em módulos e pastas para clareza:
+
+```
+transcription_library/
+├── __init__.py
+├── core/
+│   ├── __init__.py
+│   ├── interfaces.py               # Definição das interfaces e dataclasses
+│   ├── manager.py                  # Gerenciador de provedores de transcrição
+│   ├── config.py                   # Configurações globais e por provedor
+│   └── utils.py                    # Funções utilitárias compartilhadas (e.g., _get_file_hash, _get_audio_duration)
+├── providers/
+│   ├── __init__.py
+│   ├── distil_whisper_provider.py  # Implementação do Distil-Whisper
+│   ├── faster_whisper_provider.py  # Implementação do Faster-Whisper (futuro plugin)
+│   └── gemini_provider.py          # Implementação do Gemini (futuro plugin)
+└── main.py                         # Exemplo de uso da biblioteca
+```
+
+### 4. Implementação Detalhada - Fase 1: Distil-Whisper
+
+#### Passo 1: Definir Abstrações Essenciais (`core/interfaces.py`)
+
+Começaremos definindo as estruturas de dados de entrada e saída, e a interface que todo provedor de transcrição deve seguir.
+
+```python
+# transcription_library/core/interfaces.py
+import time
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+@dataclass
+class TranscriptionResult:
+    \"\"\"
+    Estrutura padrão para o resultado de uma transcrição.
+    Garante consistência na saída de diferentes provedores.
+    \"\"\"
+    text: str
+    confidence: float
+    processing_time: float # Tempo total gasto na transcrição
+    model_used: str        # Nome do modelo/serviço utilizado (e.g., \"distil-whisper-pt\", \"faster-whisper\")
+    language: str
+    segments: Optional[List[Dict]] = None # Segmentos com timestamp e texto
+    error_message: Optional[str] = None   # Mensagem de erro, se houver
+
+class ITranscriptionProvider(ABC):
+    \"\"\"
+    Interface (Classe Abstrata) para todos os provedores de transcrição.
+    Qualquer nova implementação de transcrição deve herdar desta classe
+    e implementar seus métodos abstratos.
+    \"\"\"
+    @abstractmethod
+    async def initialize(self) -> bool:
+        \"\"\"
+        Inicializa o provedor de transcrição, carregando modelos ou configurando APIs.
+        Deve ser idempotente (seguro para ser chamado múltiplas vezes).
+        Retorna True se a inicialização for bem-sucedida, False caso contrário.
+        \"\"\"
+        pass
+
+    @abstractmethod
+    async def transcribe(self, audio_path: Path, language: str = \"pt\") -> TranscriptionResult:
+        \"\"\"
+        Realiza a transcrição de um arquivo de áudio.
+        Args:
+            audio_path: Caminho para o arquivo de áudio a ser transcrito.
+            language: Código do idioma para a transcrição (padrão: \"pt\").
+        Returns:
+            Um objeto TranscriptionResult contendo o texto, confiança e metadados.
+        \"\"\"
+        pass
+
+    @abstractmethod
+    def get_name(self) -> str:
+        \"\"\"Retorna o nome único do provedor (e.g., \"distil-whisper\", \"faster-whisper\").\"\"\"
+        pass
+
+    @abstractmethod
+    def get_status(self) -> Dict[str, Any]:
+        \"\"\"Retorna informações de status do provedor (e.g., modelo carregado, uso de GPU).\"\"\"
+        pass
+
+    @abstractmethod
+    def clear_cache(self) -> None:
+        \"\"\"Limpa qualquer cache interno mantido pelo provedor.\"\"\"
+        pass
+```
+
+#### Passo 2: Funções Utilitárias Compartilhadas (`core/utils.py`)
+
+As funções `_get_file_hash`, `_get_audio_duration` e outras que são independentes do modelo específico devem ser movidas para um módulo de utilidades.
+
+```python
+# transcription_library/core/utils.py
+import asyncio
+import hashlib
+import json
+import logging
+import subprocess
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+async def get_file_hash(file_path: Path) -> str:
+    \"\"\"Gera um hash MD5 de um arquivo para uso em cache.\"\"\"
+    hash_md5 = hashlib.md5()
+    loop = asyncio.get_event_loop()
+
+    def _hash_file_sync():
+        with open(file_path, 'rb') as f:
+            for chunk in iter(lambda: f.read(4096), b\"\"):
+                hash_md5.update(chunk)
+        return hash_md5.hexdigest()
+
+    return await loop.run_in_executor(None, _hash_file_sync)
+
+async def get_audio_duration(audio_path: Path) -> float:
+    \"\"\"Obtém a duração de um arquivo de áudio usando ffprobe.\"\"\"
+    try:
+        command = [
+            'ffprobe',
+            '-v', 'quiet',
+            '-print_format', 'json',
+            '-show_format',
+            '-show_streams',
+            str(audio_path)
+        ]
+        loop = asyncio.get_event_loop()
+        process = await loop.run_in_executor(
+            None,
+            lambda: subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                check=True,
+                encoding=\"utf-8\"
+            )
+        )
+
+        metadata = json.loads(process.stdout)
+
+        if 'format' in metadata and 'duration' in metadata['format']:
+            return float(metadata['format']['duration'])
+        
+        # Fallback para streams, se a duração não estiver no formato
+        if 'streams' in metadata:
+            for stream in metadata['streams']:
+                if stream.get('codec_type') == 'audio' and 'duration' in stream:
+                    return float(stream['duration'])
+        
+        logger.warning(f\"Could not get audio duration for: {audio_path}\")
+        return 0.0
+
+    except Exception as e:
+        logger.error(f\"Error getting audio duration for {audio_path}: {e}\")
+        return 0.0
+
+# Adicionar outras utilidades conforme necessário (e.g., setup_cuda_environment se for genérico)
+# Por enquanto, o setup_cuda_environment será tratado por provedores específicos, se necessário.
+```
+
+#### Passo 3: Configuração da Biblioteca (`core/config.py`)
+
+Precisamos de uma forma centralizada de configurar qual provedor usar, quais modelos e outras opções.
+
+```python
+# transcription_library/core/config.py
+from typing import Dict, Any, Optional
+
+class AppConfig:
+    \"\"\"
+    Configurações da aplicação. Poderia ser carregado de um arquivo .env,
+    YAML, JSON, ou variáveis de ambiente.
+    \"\"\"
+    DISTIL_WHISPER_MODEL_ID: str = \"freds0/distil-whisper-large-v3-ptbr\"
+    FORCE_CPU_FOR_DISTIL_WHISPER: bool = False
+    DISTIL_WHISPER_CACHE_DIR: str = \"./transcription_cache/distil_whisper\"
+    
+    # Para futuros provedores
+    FASTER_WHISPER_MODEL_SIZE: str = \"large-v2\" # small, medium, large-v2
+    FASTER_WHISPER_CACHE_DIR: str = \"./transcription_cache/faster_whisper\"
+    
+    GEMINI_API_KEY: Optional[str] = None # Carregar de variáveis de ambiente em produção
+    GEMINI_MODEL_NAME: str = \"gemini-pro\"
+    
+    # Gerenciamento de fallback
+    PRIMARY_PROVIDER: str = \"distil-whisper-pt\"
+    FALLBACK_PROVIDERS: List[str] = [\"faster-whisper\", \"gemini-audio\"] # Ordem de fallback
+    CONFIDENCE_THRESHOLD: float = 0.6 # Limiar mínimo de confiança para aceitar uma transcrição
+
+    def __init__(self):
+        # Exemplo de carregamento de variáveis de ambiente
+        import os
+        self.GEMINI_API_KEY = os.getenv(\"GEMINI_API_KEY\", self.GEMINI_API_KEY)
+
+# Instância de configuração global
+settings = AppConfig()
+```
+
+#### Passo 4: Implementar o Provedor Distil-Whisper (`providers/distil_whisper_provider.py`)
+
+Agora vamos adaptar a lógica do `DistilWhisperProcessor` para a nossa interface `ITranscriptionProvider`.
+
+```python
+# transcription_library/providers/distil_whisper_provider.py
+import asyncio
+import logging
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import torch
+from transformers import WhisperProcessor, WhisperForConditionalGeneration, pipeline
+# from tqdm import tqdm # Opcional, para barra de progresso
+
+from ..core.interfaces import ITranscriptionProvider, TranscriptionResult
+from ..core.utils import get_file_hash, get_audio_duration
+from ..core.config import settings
+
+logger = logging.getLogger(__name__)
+
+class DistilWhisperProvider(ITranscriptionProvider):
+    def __init__(self):
+        self.model_id = settings.DISTIL_WHISPER_MODEL_ID
+        self.force_cpu = settings.FORCE_CPU_FOR_DISTIL_WHISPER
+        self.cache_dir = Path(settings.DISTIL_WHISPER_CACHE_DIR)
+        
+        self.device = \"cuda\" if torch.cuda.is_available() and not self.force_cpu else \"cpu\"
+        self.compute_type = torch.float16 if self.device == \"cuda\" else torch.float32
+        
+        self.model = None
+        self.processor = None
+        self.pipeline_instance = None # Renomeado para evitar conflito com 'pipeline' importado
+        
+        self.transcription_cache: Dict[str, TranscriptionResult] = {}
+        self.initialization_complete = False
+        
+        logger.info(f\"DistilWhisperProvider initialized for device: {self.device}\")
+
+    async def initialize(self) -> bool:
+        if self.initialization_complete:
+            return True
+        
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        
+        try:
+            logger.info(f\"Loading Distil-Whisper Portuguese model: {self.model_id} to {self.device}\")
+            start_time = time.time()
+            
+            loop = asyncio.get_event_loop()
+            
+            self.processor = await loop.run_in_executor(
+                None,
+                lambda: WhisperProcessor.from_pretrained(
+                    self.model_id,
+                    cache_dir=str(self.cache_dir)
+                )
+            )
+            
+            # Usar 'accelerate' para otimização de GPU, se disponível
+            use_accelerate = self.device == \"cuda\" and torch.cuda.is_available()
+
+            if use_accelerate:
+                self.model = await loop.run_in_executor(
+                    None,
+                    lambda: WhisperForConditionalGeneration.from_pretrained(
+                        self.model_id,
+                        dtype=self.compute_type,
+                        device_map=\"auto\",
+                        low_cpu_mem_usage=True,
+                        use_safetensors=True,
+                        cache_dir=str(self.cache_dir)
+                    )
+                )
+            else:
+                self.model = await loop.run_in_executor(
+                    None,
+                    lambda: WhisperForConditionalGeneration.from_pretrained(
+                        self.model_id,
+                        dtype=self.compute_type,
+                        device_map=\"auto\" if self.device == \"cuda\" else None,
+                        cache_dir=str(self.cache_dir)
+                    )
+                )
+            
+            self.pipeline_instance = pipeline(
+                \"automatic-speech-recognition\",
+                model=self.model,
+                tokenizer=self.processor.tokenizer,
+                feature_extractor=self.processor.feature_extractor,
+                dtype=self.compute_type,
+                chunk_length_s=25,
+                stride_length_s=5,
+                return_timestamps=True
+            )
+            
+            load_time = time.time() - start_time
+            self.initialization_complete = True
+            
+            logger.info(f\"Distil-Whisper loaded successfully on {self.device} in {load_time:.2f}s\")
+            logger.info(f\"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}\")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f\"Failed to initialize Distil-Whisper: {e}\")
+            self.initialization_complete = False
+            return False
+
+    async def transcribe(self, audio_path: Path, language: str = \"pt\") -> TranscriptionResult:
+        if not self.initialization_complete:
+            await self.initialize() # Tenta inicializar se ainda não o fez
+        
+        if not self.initialization_complete:
+            return TranscriptionResult(
+                text=\"\", confidence=0.0, processing_time=0.0,
+                model_used=self.get_name(), language=\"pt-BR\",
+                error_message=\"Model initialization failed or not complete\"
+            )
+        
+        file_hash = await get_file_hash(audio_path)
+        if file_hash in self.transcription_cache:
+            cached_result = self.transcription_cache[file_hash]
+            logger.info(f\"Using cached {self.get_name()} transcription for {audio_path.name}\")
+            return cached_result
+        
+        start_time = time.time()
+        
+        try:
+            logger.info(f\"Starting {self.get_name()} transcription for: {audio_path.name}\")
+            
+            # audio_duration = await get_audio_duration(audio_path) # Pode ser usado para tqdm
+            loop = asyncio.get_event_loop()
+            
+            # Adaptação da chamada do pipeline
+            result = await loop.run_in_executor(
+                None,
+                lambda: self.pipeline_instance(
+                    str(audio_path),
+                    generate_kwargs={
+                        \"language\": \"portuguese\", # Força português brasileiro
+                        \"task\": \"transcribe\"
+                    }
+                )
+            )
+            
+            processing_time = time.time() - start_time
+            
+            if not result or \"text\" not in result:
+                raise ValueError(f\"Invalid transcription result from {self.get_name()} pipeline\")
+            
+            transcribed_text = result[\"text\"].strip()
+            if not transcribed_text:
+                raise ValueError(f\"Empty transcription result from {self.get_name()}\")
+            
+            confidence = self._calculate_confidence(result)
+            segments = self._extract_segments(result)
+            
+            transcription_result = TranscriptionResult(
+                text=transcribed_text,
+                confidence=confidence,
+                processing_time=processing_time,
+                model_used=self.get_name(),
+                language=\"pt-BR\",
+                segments=segments
+            )
+            
+            self.transcription_cache[file_hash] = transcription_result
+            
+            logger.info(
+                f\"{self.get_name()} transcription completed for {audio_path.name}: \"
+                f\"{len(transcribed_text)} chars in {processing_time:.2f}s \"
+                f\"(confidence: {confidence:.3f})\"
+            )
+            
+            return transcription_result
+            
+        except Exception as e:
+            processing_time = time.time() - start_time
+            error_msg = f\"{self.get_name()} transcription failed for {audio_path.name}: {str(e)}\"
+            logger.error(error_msg)
+            
+            return TranscriptionResult(
+                text=\"\",
+                confidence=0.0,
+                processing_time=processing_time,
+                model_used=self.get_name(),
+                language=\"pt-BR\",
+                error_message=error_msg
+            )
+    
+    def get_name(self) -> str:
+        return \"distil-whisper-pt\"
+
+    def get_status(self) -> Dict[str, Any]:
+        return {
+            \"model_id\": self.model_id,
+            \"device\": self.device,
+            \"initialized\": self.initialization_complete,
+            \"cuda_available\": torch.cuda.is_available(),
+            \"cache_size\": len(self.transcription_cache),
+            \"model_parameters\": sum(p.numel() for p in self.model.parameters()) if self.model else 0
+        }
+    
+    def clear_cache(self) -> None:
+        self.transcription_cache.clear()
+        logger.info(f\"{self.get_name()} cache cleared\")
+    
+    def _calculate_confidence(self, result: Dict[str, Any]) -> float:
+        \"\"\"Calcula a confiança média a partir dos chunks do pipeline.\"\"\"
+        if \"chunks\" in result and result[\"chunks\"]:
+            confidences = []
+            for chunk in result[\"chunks\"]:
+                if isinstance(chunk, dict) and \"confidence\" in chunk:
+                    confidences.append(chunk[\"confidence\"])
+                else:
+                    confidences.append(0.85) # Valor padrão se a confiança não estiver disponível
+            
+            if confidences:
+                return sum(confidences) / len(confidences)
+        return 0.87 # Confiança padrão alta para o modelo Distil-Whisper PT
+    
+    def _extract_segments(self, result: Dict[str, Any]) -> Optional[List[Dict]]:
+        \"\"\"Extrai os segmentos com timestamp do resultado do pipeline.\"\"\"
+        segments = []
+        if \"chunks\" in result and result[\"chunks\"]:
+            for chunk in result[\"chunks\"]:
+                if isinstance(chunk, dict) and \"timestamp\" in chunk:
+                    segments.append({
+                        \"start\": chunk[\"timestamp\"][0] if chunk[\"timestamp\"][0] else 0.0,
+                        \"end\": chunk[\"timestamp\"][1] if chunk[\"timestamp\"][1] else 0.0,
+                        \"text\": chunk.get(\"text\", \"\"),
+                        \"confidence\": chunk.get(\"confidence\", 0.85)
+                    })
+        return segments if segments else None
+
+```
+
+#### Passo 5: Criar o Gerenciador de Transcrição (`core/manager.py`)
+
+Este componente será o coração da nossa biblioteca plugável. Ele será responsável por registrar provedores, selecionar o provedor primário e gerenciar a lógica de fallback.
+
+```python
+# transcription_library/core/manager.py
+import logging
+from pathlib import Path
+from typing import Dict, List, Optional, Type
+
+from .interfaces import ITranscriptionProvider, TranscriptionResult
+from .config import settings
+
+logger = logging.getLogger(__name__)
+
+class TranscriptionManager:
+    \"\"\"
+    Gerenciador central para provedores de transcrição.
+    Permite registrar e selecionar dinamicamente diferentes provedores
+    e gerencia a lógica de fallback.
+    \"\"\"
+    def __init__(self):
+        self._providers: Dict[str, ITranscriptionProvider] = {}
+        self._initialized_providers: Dict[str, bool] = {}
+        logger.info(\"TranscriptionManager initialized.\")
+
+    def register_provider(self, name: str, provider_instance: ITranscriptionProvider):
+        \"\"\"
+        Registra uma instância de um provedor de transcrição na biblioteca.
+        Args:
+            name: O nome único para referenciar este provedor (e.g., \"distil-whisper-pt\").
+            provider_instance: Uma instância da classe que implementa ITranscriptionProvider.
+        \"\"\"
+        if not isinstance(provider_instance, ITranscriptionProvider):
+            raise TypeError(f\"Provider must implement ITranscriptionProvider interface. Got {type(provider_instance)}\")
+        
+        if name in self._providers:
+            logger.warning(f\"Provider '{name}' already registered. Overwriting with new instance.\")
+        
+        self._providers[name] = provider_instance
+        self._initialized_providers[name] = False # Marca como não inicializado inicialmente
+        logger.info(f\"Provider '{name}' registered: {type(provider_instance).__name__}\")
+
+    async def _ensure_provider_initialized(self, name: str) -> bool:
+        \"\"\"Garante que um provedor específico seja inicializado.\"\"\"
+        if not self._providers.get(name):
+            logger.error(f\"Attempted to initialize unregistered provider: '{name}'\")
+            return False
+            
+        if not self._initialized_providers.get(name, False):
+            logger.info(f\"Initializing provider '{name}'...\")
+            success = await self._providers[name].initialize()
+            if success:
+                self._initialized_providers[name] = True
+                logger.info(f\"Provider '{name}' initialized successfully.\")
+            else:
+                logger.error(f\"Provider '{name}' failed to initialize.\")
+            return success
+        return True # Já inicializado
+
+    async def transcribe_audio(self, audio_path: Path, language: str = \"pt\") -> TranscriptionResult:
+        \"\"\"
+        Transcreve um arquivo de áudio usando o provedor primário, com fallback se necessário.
+        A lógica de seleção e fallback é configurada em `settings`.
+        \"\"\"
+        provider_chain = [settings.PRIMARY_PROVIDER] + settings.FALLBACK_PROVIDERS
+        
+        for provider_name in provider_chain:
+            provider = self._providers.get(provider_name)
+            if not provider:
+                logger.warning(f\"Configured provider '{provider_name}' is not registered. Skipping.\")
+                continue
+
+            if not await self._ensure_provider_initialized(provider_name):
+                logger.warning(f\"Provider '{provider_name}' failed to initialize. Skipping to next.\")
+                continue
+
+            logger.info(f\"Attempting transcription with provider: '{provider_name}'\")
+            result = await provider.transcribe(audio_path, language)
+
+            if result.error_message:
+                logger.warning(f\"Transcription with '{provider_name}' failed: {result.error_message}. Trying fallback.\")
+                continue # Tenta o próximo provedor em caso de erro
+
+            if result.confidence < settings.CONFIDENCE_THRESHOLD:
+                logger.warning(
+                    f\"Transcription with '{provider_name}' had low confidence ({result.confidence:.2f} \"
+                    f\"< {settings.CONFIDENCE_THRESHOLD:.2f}). Trying fallback.\"
+                )
+                continue # Tenta o próximo provedor se a confiança for baixa
+
+            logger.info(f\"Transcription successful with '{provider_name}'.\")
+            return result # Retorna o primeiro resultado bem-sucedido e com confiança adequada
+
+        # Se todos os provedores falharem
+        error_msg = \"All configured transcription providers failed or returned low confidence.\"
+        logger.error(error_msg)
+        return TranscriptionResult(
+            text=\"\", confidence=0.0, processing_time=0.0,
+            model_used=\"None\", language=language, error_message=error_msg
+        )
+
+    def get_provider_status(self, name: str) -> Optional[Dict[str, Any]]:
+        \"\"\"Retorna o status de um provedor específico.\"\"\"
+        provider = self._providers.get(name)
+        if provider:
+            return provider.get_status()
+        logger.warning(f\"Provider '{name}' not found.\")
+        return None
+
+    def get_all_providers_status(self) -> Dict[str, Dict[str, Any]]:
+        \"\"\"Retorna o status de todos os provedores registrados.\"\"\"
+        all_status = {}
+        for name, provider in self._providers.items():
+            all_status[name] = provider.get_status()
+        return all_status
+
+    def clear_all_caches(self) -> None:
+        \"\"\"Limpa o cache de todos os provedores registrados.\"\"\"
+        for name, provider in self._providers.items():
+            provider.clear_cache()
+            logger.info(f\"Cache cleared for provider: {name}\")
+
+    async def shutdown(self):
+        \"\"\"Método para realizar o desligamento gracioso (se necessário, por exemplo, para liberar recursos).\"\"\"
+        logger.info(\"Shutting down TranscriptionManager.\")
+        self.clear_all_caches()
+        # Outras lógicas de shutdown, se necessário, como liberar modelos da memória, etc.
+        # Para modelos transformers, isso geralmente é gerenciado pelo Python GC.
+```
+
+#### Passo 6: Exemplo de Uso (`main.py`)
+
+Agora, como o usuário final interagiria com essa biblioteca.
+
+```python
+# transcription_library/main.py
+import asyncio
+import logging
+from pathlib import Path
+
+# Configuração básica de logging
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+# Importar o gerenciador e o provedor Distil-Whisper
+from core.manager import TranscriptionManager
+from providers.distil_whisper_provider import DistilWhisperProvider
+from core.config import settings # Para configurar qual provedor é primário/fallback
+
+async def main():
+    logger = logging.getLogger(\"main_app\")
+    logger.info(\"Iniciando aplicação de transcrição plugável.\")
+
+    manager = TranscriptionManager()
+
+    # --- 1. Registrar os Provedores de Transcrição ---
+    # Para começar, registramos apenas o Distil-Whisper.
+    # No futuro, outros provedores (Faster-Whisper, Gemini) seriam registrados aqui.
+    
+    distil_provider = DistilWhisperProvider()
+    manager.register_provider(distil_provider.get_name(), distil_provider)
+
+    # --- 2. Preparar um arquivo de áudio para transcrição ---
+    # Você precisará de um arquivo de áudio real para testar.
+    # Exemplo: um arquivo .mp3 ou .wav em português.
+    audio_file_path = Path(\"caminho/para/seu/audio.mp3\") 
+    
+    # Crie um arquivo dummy para testes se não tiver um real
+    if not audio_file_path.exists():
+        logger.warning(f\"Arquivo de áudio dummy não encontrado em '{audio_file_path}'. \"
+                       \"Criando um arquivo placeholder. A transcrição não funcionará de fato.\")
+        # É importante notar que este arquivo dummy não é um áudio válido e a transcrição irá falhar.
+        # Serve apenas para demonstrar o fluxo da aplicação.
+        audio_file_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(audio_file_path, \"w\") as f:
+            f.write(\"Este é um arquivo de texto dummy, não um áudio real.\")
+        logger.warning(\"Por favor, substitua 'caminho/para/seu/audio.mp3' por um arquivo de áudio real para testes.\")
+        # Para continuar com um exemplo que realmente tenta processar, pode-se pular a execução
+        # ou fornecer um áudio pequeno de teste. Por enquanto, a demonstração continuará.
+    
+    logger.info(f\"Tentando transcrever o arquivo: {audio_file_path.name}\")
+
+    # --- 3. Executar a Transcrição ---
+    result = await manager.transcribe_audio(audio_file_path, language=\"pt\")
+
+    # --- 4. Exibir o Resultado ---
+    if result.error_message:
+        logger.error(f\"A transcrição falhou completamente: {result.error_message}\")
+    else:
+        logger.info(f\"Transcrição bem-sucedida usando o modelo: {result.model_used}\")
+        logger.info(f\"Confiança da transcrição: {result.confidence:.2f}\")
+        logger.info(\"\\n--- Transcrição Completa ---\\n\")
+        print(result.text)
+        logger.info(\"\\n----------------------------\\n\")
+        
+        if result.segments:
+            logger.info(\"\\n--- Segmentos da Transcrição ---\\n\")
+            for segment in result.segments[:5]: # Mostrar apenas os primeiros 5 segmentos
+                print(f\"[{segment['start']:.2f}s - {segment['end']:.2f}s]: {segment['text']}\")
+            if len(result.segments) > 5:
+                print(f\"... e mais {len(result.segments) - 5} segmentos.\")
+            logger.info(\"\\n--------------------------------\\n\")
+
+    # --- 5. Obter Status dos Provedores ---
+    logger.info(\"\\n--- Status dos Provedores Registrados ---\")
+    all_status = manager.get_all_providers_status()
+    for name, status_info in all_status.items():
+        logger.info(f\"Status para '{name}': {status_info}\")
+    logger.info(\"------------------------------------------\\n\")
+
+    # --- 6. Limpar Caches (Opcional) ---
+    # manager.clear_all_caches()
+    # logger.info(\"Todos os caches de provedores foram limpos.\")
+
+    await manager.shutdown()
+    logger.info(\"Aplicação de transcrição finalizada.\")
+
+if __name__ == \"__main__\":
+    asyncio.run(main())
+```
+
+### 7. Considerações Adicionais e Próximos Passos
+
+1.  **Configuração do Ambiente CUDA (`setup_cuda_environment`):**
+    *   No seu `transcriber.py`, `setup_cuda_environment()` é chamado dentro de `transcribe()`.
+    *   Para Distil-Whisper, o `transformers` e `torch` geralmente gerenciam o CUDA de forma mais integrada.
+    *   Se `setup_cuda_environment` for realmente necessário para `faster-whisper`, ele deve ser chamado durante a inicialização do `FasterWhisperProvider` ou por uma função utilitária global no início da aplicação, antes de qualquer modelo tentar usar CUDA.
+
+2.  **Gerenciamento de Modelos:**
+    *   Atualmente, os modelos são baixados para um diretório de cache. Considere um sistema mais robusto para gerenciar modelos baixados, especialmente se você tiver muitos provedores com grandes modelos.
+
+3.  **Implementação do Faster-Whisper Provider:**
+    *   Você pode criar um `FasterWhisperProvider` seguindo a mesma interface `ITranscriptionProvider`, encapsulando a lógica do seu `transcriber.py`.
+    *   Ele precisaria gerenciar o `WhisperModel` e usar o `setup_cuda_environment` em sua própria inicialização, se aplicável.
+
+4.  **Implementação do Gemini Provider (para Áudio e/ou Vídeo):**
+    *   Crie um `GeminiAudioProvider` e/ou `GeminiVideoProvider` que se integre à API Gemini, novamente implementando `ITranscriptionProvider`.
+    *   O `GeminiVideoProcessor` do seu `transcription.txt` pode ser a base para o `GeminiVideoProvider`.
+    *   O tratamento de áudio pelo Gemini (se houver um endpoint direto para isso, além do fallback de emergência) também pode ser um provedor.
+
+5.  **Testes Robustos:**
+    *   Escreva testes unitários para cada provedor individualmente.
+    *   Escreva testes de integração para o `TranscriptionManager`, verificando a lógica de fallback e a interação entre os provedores.
+
+6.  **Gerenciamento de Dependências:**
+    *   Use um `requirements.txt` ou `pyproject.toml` para listar todas as dependências (`torch`, `transformers`, `faster-whisper`, `google-generativeai`, `ffprobe` etc.).
+
+7.  **Flexibilidade de Configuração:**
+    *   A `AppConfig` pode ser expandida para carregar configurações de arquivos externos (YAML, JSON) ou variáveis de ambiente, tornando a biblioteca ainda mais adaptável a diferentes ambientes de implantação.
+
+8.  **Logging:**
+    *   Utilize o módulo `logging` do Python de forma consistente para ter uma visão clara do que está acontecendo na sua biblioteca, especialmente durante a seleção de provedores e fallbacks.
+
+Este plano detalhado e a estrutura de código fornecida devem servir como um guia robusto para construir sua biblioteca de transcrição plugável. Ao seguir esses princípios e etapas, você terá um sistema flexível, escalável e fácil de manter!
+Pergunta: certo, crie o que seria o faster_whispe_provider.py e o gemini_provider.py, além disso gostaria que no gemini_provider fosse possível transcrever também arquivo de vídeo.
+Resposta: Com certeza! É uma ótima ideia estender a pluggabilidade para Faster-Whisper e Gemini, incluindo a capacidade de transcrever vídeos com este último. Isso tornará sua biblioteca ainda mais versátil.
+
+Vamos criar os arquivos `faster_whisper_provider.py` e `gemini_provider.py` e fazer as atualizações necessárias em `core/config.py`.
+
+---
+
+### Atualização do Arquivo `core/config.py`
+
+Primeiro, vamos adicionar as configurações para Faster-Whisper e Gemini no seu arquivo `core/config.py`.
+
+```python
+# transcription_library/core/config.py
+import os
+from typing import Dict, Any, List, Optional
+
+class AppConfig:
+    \"\"\"
+    Configurações da aplicação. Carrega de variáveis de ambiente se disponíveis.
+    \"\"\"
+    # --- Configurações para Distil-Whisper ---
+    DISTIL_WHISPER_MODEL_ID: str = \"freds0/distil-whisper-large-v3-ptbr\"
+    FORCE_CPU_FOR_DISTIL_WHISPER: bool = False
+    DISTIL_WHISPER_CACHE_DIR: str = \"./transcription_cache/distil_whisper\"
+    
+    # --- Configurações para Faster-Whisper ---
+    FASTER_WHISPER_MODEL_SIZE: str = \"medium\" # ou \"small\", \"base\", \"large-v2\", \"large-v3\"
+    FASTER_WHISPER_CACHE_DIR: str = \"./transcription_cache/faster_whisper\"
+    FASTER_WHISPER_FORCE_CPU: bool = False # Se True, força uso de CPU para Faster-Whisper
+    
+    # --- Configurações para Gemini (Google AI Studio) ---
+    GEMINI_API_KEY: Optional[str] = None 
+    GEMINI_MODEL_NAME: str = \"gemini-pro\" # Ou \"gemini-pro-vision\" se quiser usar a versão com visão explicitamente
+    GEMINI_VIDEO_TIMEOUT: float = 300.0 # Timeout em segundos para operações de vídeo com Gemini
+    MAX_VIDEO_SIZE_MB: int = 200 # Tamanho máximo de vídeo em MB para upload no Gemini
+    
+    # --- Configurações Gerais do Gerenciador ---
+    PRIMARY_PROVIDER: str = \"distil-whisper-pt\" # Provedor padrão
+    # Ordem de fallback: se o primário falhar, tenta o próximo na lista
+    FALLBACK_PROVIDERS: List[str] = [\"faster-whisper\", \"gemini-hybrid\"] 
+    CONFIDENCE_THRESHOLD: float = 0.6 # Limiar mínimo de confiança para aceitar uma transcrição
+    
+    # --- Caminhos de ferramentas externas ---
+    # Se ffprobe ou cudnn não estiverem no PATH, podem ser configurados aqui
+    FFPROBE_PATH: Optional[str] = None # Ex: \"/usr/local/bin/ffprobe\"
+    CUDNN_PATH: Optional[str] = None # Ex: \"/usr/local/cuda/lib64\"
+
+    def __init__(self):
+        # Carregar variáveis de ambiente (MELHOR PRÁTICA)
+        self.GEMINI_API_KEY = os.getenv(\"GEMINI_API_KEY\", self.GEMINI_API_KEY)
+        self.FFPROBE_PATH = os.getenv(\"FFPROBE_PATH\", self.FFPROBE_PATH)
+        self.CUDNN_PATH = os.getenv(\"CUDNN_PATH\", self.CUDNN_PATH)
+
+# Instância de configuração global
+settings = AppConfig()
+```
+
+---
+
+### Arquivo `transcription_library/providers/faster_whisper_provider.py`
+
+Este provedor usará a biblioteca `faster-whisper` para transcrição de áudio.
+
+```python
+# transcription_library/providers/faster_whisper_provider.py
+import asyncio
+import logging
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+from faster_whisper import WhisperModel
+from numba import cuda # Para verificar disponibilidade de CUDA
+
+from ..core.interfaces import ITranscriptionProvider, TranscriptionResult
+from ..core.utils import get_audio_duration, get_file_hash # Reutilizamos o get_audio_duration
+from ..core.config import settings
+
+logger = logging.getLogger(__name__)
+
+class FasterWhisperProvider(ITranscriptionProvider):
+    def __init__(self):
+        self.model_size = settings.FASTER_WHISPER_MODEL_SIZE
+        self.cache_dir = Path(settings.FASTER_WHISPER_CACHE_DIR)
+        self.force_cpu = settings.FASTER_WHISPER_FORCE_CPU
+
+        self.model: Optional[WhisperModel] = None
+        self.device: str = \"cpu\"
+        self.compute_type: str = \"int8\" # Padrão para CPU ou menor consumo
+        
+        self.transcription_cache: Dict[str, TranscriptionResult] = {}
+        self.initialization_complete = False
+        
+        # Determinar dispositivo e tipo de computação
+        if self.force_cpu:
+            self.device = \"cpu\"
+            self.compute_type = \"auto\"
+            logger.info(\"FasterWhisperProvider: Forçando uso de CPU.\")
+        elif cuda.is_available():
+            self.device = \"cuda\"
+            self.compute_type = \"float16\" # float16 para CUDA geralmente
+            logger.info(\"FasterWhisperProvider: CUDA disponível. Usando GPU.\")
+        else:
+            self.device = \"cpu\"
+            self.compute_type = \"auto\"
+            logger.info(\"FasterWhisperProvider: CUDA não disponível. Usando CPU.\")
+
+    async def initialize(self) -> bool:
+        if self.initialization_complete:
+            return True
+        
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        
+        try:
+            logger.info(f\"Loading Faster-Whisper model: {self.model_size} on {self.device} ({self.compute_type})\")
+            start_time = time.time()
+            
+            loop = asyncio.get_event_loop()
+            
+            self.model = await loop.run_in_executor(
+                None,
+                lambda: WhisperModel(
+                    self.model_size,
+                    device=self.device,
+                    compute_type=self.compute_type,
+                    download_dir=str(self.cache_dir)
+                )
+            )
+            
+            load_time = time.time() - start_time
+            self.initialization_complete = True
+            
+            logger.info(f\"Faster-Whisper loaded successfully in {load_time:.2f}s\")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f\"Failed to initialize Faster-Whisper: {e}\")
+            self.initialization_complete = False
+            return False
+
+    async def transcribe(self, audio_path: Path, language: str = \"pt\") -> TranscriptionResult:
+        if not self.initialization_complete:
+            await self.initialize() # Tenta inicializar se ainda não o fez
+        
+        if not self.initialization_complete:
+            return TranscriptionResult(
+                text=\"\", confidence=0.0, processing_time=0.0,
+                model_used=self.get_name(), language=language,
+                error_message=\"Model initialization failed or not complete\"
+            )
+        
+        file_hash = await get_file_hash(audio_path)
+        if file_hash in self.transcription_cache:
+            cached_result = self.transcription_cache[file_hash]
+            logger.info(f\"Using cached {self.get_name()} transcription for {audio_path.name}\")
+            return cached_result
+        
+        start_time = time.time()
+        
+        try:
+            logger.info(f\"Starting {self.get_name()} transcription for: {audio_path.name}\")
+            
+            loop = asyncio.get_event_loop()
+            
+            # Faster-Whisper retorna segmentos e informações
+            segments_generator, info = await loop.run_in_executor(
+                None,
+                lambda: self.model.transcribe(
+                    str(audio_path),
+                    language=language, # Use o idioma passado
+                    beam_size=5,       # Parâmetro otimizado para Faster-Whisper
+                    vad_filter=True    # Filtragem de voz para melhor qualidade
+                )
+            )
+            
+            full_text_segments = []
+            segments_metadata = []
+            
+            for segment in segments_generator:
+                full_text_segments.append(segment.text)
+                segments_metadata.append({
+                    \"start\": round(segment.start, 2),
+                    \"end\": round(segment.end, 2),
+                    \"text\": segment.text,
+                    \"confidence\": 0.8 # Faster-Whisper não oferece confiança de segmento, usar padrão
+                })
+            
+            transcribed_text = \" \".join(full_text_segments).strip()
+            processing_time = time.time() - start_time
+            
+            # A confiança para Faster-Whisper é heurística ou baseada no modelo
+            # Podemos usar info.language_probability para uma estimativa
+            confidence = info.language_probability if info.language_probability is not None else 0.8
+            
+            transcription_result = TranscriptionResult(
+                text=transcribed_text,
+                confidence=confidence,
+                processing_time=processing_time,
+                model_used=self.get_name(),
+                language=info.language if info.language else language,
+                segments=segments_metadata
+            )
+            
+            self.transcription_cache[file_hash] = transcription_result
+            
+            logger.info(
+                f\"{self.get_name()} transcription completed for {audio_path.name}: \"
+                f\"{len(transcribed_text)} chars in {processing_time:.2f}s \"
+                f\"(confidence: {confidence:.3f})\"
+            )
+            
+            return transcription_result
+            
+        except Exception as e:
+            processing_time = time.time() - start_time
+            error_msg = f\"{self.get_name()} transcription failed for {audio_path.name}: {str(e)}\"
+            logger.error(error_msg)
+            
+            return TranscriptionResult(
+                text=\"\",
+                confidence=0.0,
+                processing_time=processing_time,
+                model_used=self.get_name(),
+                language=language,
+                error_message=error_msg
+            )
+    
+    def get_name(self) -> str:
+        return \"faster-whisper\"
+
+    def get_status(self) -> Dict[str, Any]:
+        return {
+            \"model_size\": self.model_size,
+            \"device\": self.device,
+            \"compute_type\": self.compute_type,
+            \"initialized\": self.initialization_complete,
+            \"cuda_available\": cuda.is_available(),
+            \"cache_size\": len(self.transcription_cache)
+        }
+    
+    def clear_cache(self) -> None:
+        self.transcription_cache.clear()
+        logger.info(f\"{self.get_name()} cache cleared\")
+
+```
+
+---
+
+### Arquivo `transcription_library/providers/gemini_provider.py`
+
+Este provedor usará a API Gemini para transcrever tanto arquivos de áudio quanto de vídeo.
+
+```python
+# transcription_library/providers/gemini_provider.py
+import asyncio
+import logging
+import time
+import os
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import google.generativeai as genai
+import mimetypes # Para determinar o tipo MIME
+
+from ..core.interfaces import ITranscriptionProvider, TranscriptionResult
+from ..core.utils import get_file_hash
+from ..core.config import settings
+
+logger = logging.getLogger(__name__)
+
+class GeminiProvider(ITranscriptionProvider):
+    def __init__(self):
+        self.api_key = settings.GEMINI_API_KEY
+        self.model_name = settings.GEMINI_MODEL_NAME
+        self.video_timeout = settings.GEMINI_VIDEO_TIMEOUT
+        self.max_video_size_mb = settings.MAX_VIDEO_SIZE_MB
+
+        self.gemini_model: Optional[genai.GenerativeModel] = None
+        self.transcription_cache: Dict[str, TranscriptionResult] = {}
+        self.initialization_complete = False
+
+        if not self.api_key:
+            logger.warning(\"Gemini API key is not configured. GeminiProvider will not function.\")
+
+    async def initialize(self) -> bool:
+        if self.initialization_complete:
+            return True
+        
+        if not self.api_key:
+            logger.error(\"Gemini API key is missing. Cannot initialize GeminiProvider.\")
+            self.initialization_complete = False
+            return False
+
+        try:
+            genai.configure(api_key=self.api_key)
+            self.gemini_model = genai.GenerativeModel(self.model_name)
+            self.initialization_complete = True
+            logger.info(f\"GeminiProvider initialized with model: {self.model_name}\")
+            return True
+        except Exception as e:
+            logger.error(f\"Failed to initialize GeminiProvider: {e}\")
+            self.initialization_complete = False
+            return False
+
+    async def transcribe(self, file_path: Path, language: str = \"pt-BR\") -> TranscriptionResult:
+        if not self.initialization_complete:
+            await self.initialize()
+        
+        if not self.initialization_complete:
+            return TranscriptionResult(
+                text=\"\", confidence=0.0, processing_time=0.0,
+                model_used=self.get_name(), language=language,
+                error_message=\"GeminiProvider not initialized due to missing API key or error.\"
+            )
+
+        # Usar o hash do arquivo para o cache
+        file_hash = await get_file_hash(file_path)
+        if file_hash in self.transcription_cache:
+            cached_result = self.transcription_cache[file_hash]
+            logger.info(f\"Using cached Gemini transcription for {file_path.name}\")
+            return cached_result
+        
+        # Determinar se é áudio ou vídeo baseado na extensão
+        mime_type = mimetypes.guess_type(file_path)[0]
+        if mime_type and (mime_type.startswith('audio') or mime_type.startswith('video')):
+            if mime_type.startswith('audio'):
+                result = await self._transcribe_audio_with_gemini(file_path, language)
+            else: # Considerar como vídeo se não for áudio e for um tipo de mídia conhecido
+                result = await self._transcribe_video_with_gemini(file_path, language)
+        else:
+            error_msg = f\"Unsupported file type for Gemini transcription: {file_path.suffix}\"
+            logger.error(error_msg)
+            result = TranscriptionResult(
+                text=\"\", confidence=0.0, processing_time=0.0,
+                model_used=self.get_name(), language=language,
+                error_message=error_msg
+            )
+        
+        # Armazenar em cache o resultado bem-sucedido
+        if not result.error_message:
+            self.transcription_cache[file_hash] = result
+        
+        return result
+
+    async def _transcribe_audio_with_gemini(self, audio_path: Path, language: str) -> TranscriptionResult:
+        \"\"\"Transcreve áudio usando a API Gemini.\"\"\"
+        start_time = time.time()
+        try:
+            with open(audio_path, 'rb') as audio_file:
+                audio_data = audio_file.read()
+            
+            audio_part = {
+                \"mime_type\": self._get_mime_type(audio_path),
+                \"data\": audio_data
+            }
+            
+            prompt = f\"\"\"Transcreva este áudio em português brasileiro com precisão.
+            Retorne apenas o texto transcrito sem comentários adicionais.\"\"\"
+            
+            loop = asyncio.get_event_loop()
+            response = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None,
+                    lambda: self.gemini_model.generate_content([prompt, audio_part])
+                ),
+                timeout=self.video_timeout # Reutiliza o timeout de vídeo, pode ser ajustado
+            )
+            
+            processing_time = time.time() - start_time
+            if response and response.text:
+                transcribed_text = response.text.strip()
+                confidence = self._calculate_gemini_confidence(transcribed_text)
+                logger.info(f\"Gemini audio transcription completed for {audio_path.name} (confidence: {confidence:.3f})\")
+                return TranscriptionResult(
+                    text=transcribed_text,
+                    confidence=confidence,
+                    processing_time=processing_time,
+                    model_used=self.get_name() + \"-audio\",
+                    language=language
+                )
+            else:
+                raise ValueError(\"No text response from Gemini API for audio.\")
+        except asyncio.TimeoutError:
+            error_msg = f\"Gemini audio transcription timed out after {self.video_timeout}s for {audio_path.name}\"
+            logger.error(error_msg)
+            return TranscriptionResult(
+                text=\"\", confidence=0.0, processing_time=time.time() - start_time,
+                model_used=self.get_name() + \"-audio\", language=language, error_message=error_msg
+            )
+        except Exception as e:
+            error_msg = f\"Gemini audio transcription failed for {audio_path.name}: {str(e)}\"
+            logger.error(error_msg)
+            return TranscriptionResult(
+                text=\"\", confidence=0.0, processing_time=time.time() - start_time,
+                model_used=self.get_name() + \"-audio\", language=language, error_message=error_msg
+            )
+
+    async def _transcribe_video_with_gemini(self, video_path: Path, language: str) -> TranscriptionResult:
+        \"\"\"Transcreve vídeo usando a API Gemini, incluindo reconhecimento de texto visual.\"\"\"
+        start_time = time.time()
+        try:
+            if not await self._validate_video_file(video_path):
+                raise ValueError(\"Video file validation failed.\")
+
+            video_file_part = await self._upload_video_to_gemini(video_path)
+            if not video_file_part:
+                raise Exception(\"Failed to upload video to Gemini API.\")
+
+            prompt = f\"\"\"Transcreva este vídeo em português. Caso não tenha som liste os textos exibidos na tela em ordem. Também forneça uma descrição do que o vídeo apresenta (mesmo que tenha áudio).
+
+Instruções específicas:
+- Se houver fala, transcreva com precisão em português brasileiro
+- Se não houver fala mas houver texto na tela, liste todos os textos visíveis em ordem cronológica
+- Se não houver fala nem texto, descreva o conteúdo visual do vídeo.
+- Se houver tanto fala quanto texto, inclua ambos separadamente
+- Mantenha a formatação e pontuação adequadas
+- Ignore música de fundo, concentre-se na fala e textos
+
+Formato de resposta:
+[FALA]: (transcrição da fala, se houver)
+[TEXTO]: (textos visíveis na tela, se houver)
+[DESCRIÇÃO VISUAL]: (descrição detalhada do que ocorre no vídeo, se não houver fala nem texto visível, ou um resumo adicional)
+\"\"\"
+            loop = asyncio.get_event_loop()
+            response = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None,
+                    lambda: self.gemini_model.generate_content([prompt, video_file_part])
+                ),
+                timeout=self.video_timeout
+            )
+
+            processing_time = time.time() - start_time
+            if response and response.text:
+                transcribed_text = response.text.strip()
+                confidence = self._calculate_gemini_confidence(transcribed_text)
+                logger.info(f\"Gemini video transcription completed for {video_path.name} (confidence: {confidence:.3f})\")
+                return TranscriptionResult(
+                    text=transcribed_text,
+                    confidence=confidence,
+                    processing_time=processing_time,
+                    model_used=self.get_name() + \"-video\",
+                    language=language
+                )
+            else:
+                raise ValueError(\"No text response from Gemini API for video.\")
+        except asyncio.TimeoutError:
+            error_msg = f\"Gemini video transcription timed out after {self.video_timeout}s for {video_path.name}\"
+            logger.error(error_msg)
+            return TranscriptionResult(
+                text=\"\", confidence=0.0, processing_time=time.time() - start_time,
+                model_used=self.get_name() + \"-video\", language=language, error_message=error_msg
+            )
+        except Exception as e:
+            error_msg = f\"Gemini video transcription failed for {video_path.name}: {str(e)}\"
+            logger.error(error_msg)
+            return TranscriptionResult(
+                text=\"\", confidence=0.0, processing_time=time.time() - start_time,
+                model_used=self.get_name() + \"-video\", language=language, error_message=error_msg
+            )
+
+    def get_name(self) -> str:
+        return \"gemini-hybrid\"
+
+    def get_status(self) -> Dict[str, Any]:
+        return {
+            \"model_name\": self.model_name,
+            \"initialized\": self.initialization_complete,
+            \"api_key_configured\": bool(self.api_key),
+            \"cache_size\": len(self.transcription_cache),
+            \"video_timeout\": self.video_timeout,
+            \"max_video_size_mb\": self.max_video_size_mb
+        }
+
+    def clear_cache(self) -> None:
+        self.transcription_cache.clear()
+        logger.info(f\"{self.get_name()} cache cleared\")
+
+    # --- Funções Auxiliares (adaptadas do seu código original) ---
+    def _get_mime_type(self, file_path: Path) -> str:
+        \"\"\"Determina o tipo MIME para um arquivo, priorizando mimetypes padrão.\"\"\"
+        mime_type, _ = mimetypes.guess_type(file_path)
+        if mime_type:
+            return mime_type
+        # Fallback para extensões comuns se mimetypes não adivinhar
+        suffix = file_path.suffix.lower()
+        mime_types_map = {
+            '.mp3': 'audio/mpeg',
+            '.wav': 'audio/wav',
+            '.m4a': 'audio/mp4',
+            '.ogg': 'audio/ogg',
+            '.opus': 'audio/opus',
+            '.mp4': 'video/mp4',
+            '.webm': 'video/webm',
+            '.mov': 'video/quicktime',
+            '.avi': 'video/x-msvideo',
+            '.mkv': 'video/x-matroska'
+        }
+        return mime_types_map.get(suffix, 'application/octet-stream') # Retorno genérico
+
+    async def _validate_video_file(self, video_path: Path) -> bool:
+        \"\"\"Valida o arquivo de vídeo para processamento Gemini.\"\"\"
+        if not video_path.exists():
+            logger.error(f\"Video file does not exist: {video_path}\")
+            return False
+
+        file_size_mb = video_path.stat().st_size / (1024 * 1024)
+        if file_size_mb > self.max_video_size_mb:
+            logger.error(f\"Video file too large: {file_size_mb:.1f}MB > {self.max_video_size_mb}MB\")
+            return False
+
+        supported_video_formats = [\".mp4\", \".webm\", \".mov\", \".avi\", \".mkv\"]
+        if video_path.suffix.lower() not in supported_video_formats:
+            logger.error(f\"Unsupported video format: {video_path.suffix}\")
+            return False
+        return True
+
+    async def _upload_video_to_gemini(self, video_path: Path):
+        \"\"\"Faz o upload do arquivo de vídeo para a API Gemini.\"\"\"
+        try:
+            loop = asyncio.get_event_loop()
+            video_file = await loop.run_in_executor(
+                None,
+                lambda: genai.upload_file(str(video_path))
+            )
+            
+            while video_file.state.name == \"PROCESSING\":
+                logger.info(\"Waiting for video processing by Gemini...\")
+                await asyncio.sleep(2)
+                video_file = await loop.run_in_executor(
+                    None,
+                    lambda: genai.get_file(video_file.name)
+                )
+
+            if video_file.state.name == \"FAILED\":
+                raise Exception(f\"Video processing failed: {video_file.state}\")
+            
+            return video_file
+        except Exception as e:
+            logger.error(f\"Error uploading video to Gemini: {e}\")
+            return None
+
+    def _calculate_gemini_confidence(self, text: str) -> float:
+        \"\"\"Calcula a pontuação de confiança para resultados Gemini usando heurísticas.\"\"\"
+        base_confidence = 0.8
+        if \"[FALA]:\" in text or \"[TEXTO]:\" in text or \"[DESCRIÇÃO VISUAL]:\" in text:
+            base_confidence += 0.1
+        if len(text.strip()) < 50: # Penalidade para respostas muito curtas
+            base_confidence -= 0.2
+        if \"não foi possível\" in text.lower() or \"erro\" in text.lower() or \"não detectado\" in text.lower():
+            base_confidence -= 0.4
+        
+        return max(0.1, min(0.95, base_confidence))
+
+```
+
+---
+
+### Exemplo de Uso Atualizado (`main.py`)
+
+Agora, seu `main.py` pode registrar e utilizar todos os provedores:
+
+```python
+# transcription_library/main.py
+import asyncio
+import logging
+from pathlib import Path
+import os
+
+# Configuração básica de logging
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+# Importar o gerenciador e os provedores
+from core.manager import TranscriptionManager
+from providers.distil_whisper_provider import DistilWhisperProvider
+from providers.faster_whisper_provider import FasterWhisperProvider
+from providers.gemini_provider import GeminiProvider
+from core.config import settings # Para configurar qual provedor é primário/fallback
+
+# --- Exemplo de Configuração de Variável de Ambiente (simulação) ---
+# Em um ambiente real, você definiria isso como uma variável de ambiente
+# Ex: export GEMINI_API_KEY=\"SUA_CHAVE_API_GEMINI\"
+# Para testar, você pode descomentar e definir diretamente (NÃO FAZER ISSO EM PRODUÇÃO)
+# os.environ[\"GEMINI_API_KEY\"] = \"SUA_CHAVE_API_GEMINI_AQUI\" 
+# settings.GEMINI_API_KEY = os.getenv(\"GEMINI_API_KEY\") # Recarregar a chave na instância de settings
+
+async def main():
+    logger = logging.getLogger(\"main_app\")
+    logger.info(\"Iniciando aplicação de transcrição plugável.\")
+
+    manager = TranscriptionManager()
+
+    # --- 1. Registrar os Provedores de Transcrição ---
+    distil_provider = DistilWhisperProvider()
+    manager.register_provider(distil_provider.get_name(), distil_provider)
+
+    faster_provider = FasterWhisperProvider()
+    manager.register_provider(faster_provider.get_name(), faster_provider)
+
+    gemini_provider = GeminiProvider()
+    manager.register_provider(gemini_provider.get_name(), gemini_provider)
+
+    # --- 2. Preparar arquivos de mídia para transcrição ---
+    # Substitua pelos caminhos reais dos seus arquivos para testar!
+    # Lembre-se que Gemini exige uma chave de API válida para funcionar.
+    
+    # Exemplo de arquivo de áudio (MP3 ou WAV)
+    audio_file_path = Path(\"caminho/para/seu/audio_portugues.mp3\") 
+    
+    # Exemplo de arquivo de vídeo (MP4, WebM)
+    video_file_path = Path(\"caminho/para/seu/video_portugues.mp4\")
+
+    # Criar arquivos dummy se não existirem para evitar FileNotFoundError imediato
+    if not audio_file_path.exists():
+        logger.warning(f\"Arquivo de áudio dummy não encontrado em '{audio_file_path}'. \"
+                       \"Crie um arquivo de áudio real para testes eficazes.\")
+        audio_file_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(audio_file_path, \"w\") as f: f.write(\"dummy audio content\")
+    
+    if not video_file_path.exists():
+        logger.warning(f\"Arquivo de vídeo dummy não encontrado em '{video_file_path}'. \"
+                       \"Crie um arquivo de vídeo real para testes eficazes.\")
+        video_file_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(video_file_path, \"w\") as f: f.write(\"dummy video content\")
+
+    logger.info(f\"Tentando transcrever o arquivo de áudio: {audio_file_path.name}\")
+    audio_result = await manager.transcribe_audio(audio_file_path, language=\"pt\")
+
+    if audio_result.error_message:
+        logger.error(f\"A transcrição de áudio falhou: {audio_result.error_message}\")
+    else:
+        logger.info(f\"Transcrição de áudio bem-sucedida usando: {audio_result.model_used}\")
+        logger.info(f\"Confiança: {audio_result.confidence:.2f}\")
+        print(\"\\n--- Transcrição de Áudio Completa ---\\n\")
+        print(audio_result.text)
+        print(\"\\n--------------------------------------\\n\")
+    
+    # --- Teste de Transcrição de Vídeo com Gemini ---
+    if settings.GEMINI_API_KEY:
+        logger.info(f\"Tentando transcrever o arquivo de vídeo: {video_file_path.name} com Gemini\")
+        video_result = await manager.transcribe_audio(video_file_path, language=\"pt-BR\") # Manager aceita qualquer Path
+        
+        if video_result.error_message:
+            logger.error(f\"A transcrição de vídeo falhou: {video_result.error_message}\")
+        else:
+            logger.info(f\"Transcrição de vídeo bem-sucedida usando: {video_result.model_used}\")
+            logger.info(f\"Confiança: {video_result.confidence:.2f}\")
+            print(\"\\n--- Transcrição de Vídeo (Gemini) Completa ---\\n\")
+            print(video_result.text)
+            print(\"\\n-----------------------------------------------\\n\")
+    else:
+        logger.warning(\"GEMINI_API_KEY não configurada. Pulando o teste de transcrição de vídeo.\")
+
+
+    # --- 3. Obter Status dos Provedores ---
+    logger.info(\"\\n--- Status dos Provedores Registrados ---\")
+    all_status = manager.get_all_providers_status()
+    for name, status_info in all_status.items():
+        logger.info(f\"Status para '{name}': {status_info}\")
+    logger.info(\"------------------------------------------\\n\")
+
+    await manager.shutdown()
+    logger.info(\"Aplicação de transcrição finalizada.\")
+
+if __name__ == \"__main__\":
+    asyncio.run(main())
+```
+
+---
+
+### Explicações e Considerações Finais:
+
+1.  **`FasterWhisperProvider`:**
+    *   Implementa `ITranscriptionProvider`.
+    *   Determina o dispositivo (CPU/CUDA) e `compute_type` na inicialização, com opção de forçar CPU via `settings`.
+    *   Usa `WhisperModel` do `faster_whisper` para carregar e transcrever o modelo.
+    *   O método `transcribe` delega a chamada assíncrona ao `self.model.transcribe`.
+    *   **Confiança:** Como `faster-whisper` não retorna um score de confiança por segmento, usei `info.language_probability` para a confiança geral do áudio e um valor padrão para a confiança dos segmentos.
+    *   Reutiliza `get_audio_duration` e `get_file_hash` de `core.utils`.
+
+2.  **`GeminiProvider`:**
+    *   Implementa `ITranscriptionProvider`.
+    *   **Unificado:** O método `transcribe` é inteligente o suficiente para determinar se o `file_path` fornecido é um áudio ou um vídeo (baseado no MIME type/extensão) e então chama o método interno apropriado (`_transcribe_audio_with_gemini` ou `_transcribe_video_with_gemini`).
+    *   **Áudio com Gemini:** Adaptei a lógica de \"fallback de emergência\" do seu código para ser um provedor primário para áudio.
+    *   **Vídeo com Gemini:** Integrei a lógica completa do seu `GeminiVideoProcessor` (validação de arquivo, upload, e prompt otimizado para fala, texto visual e descrição).
+    *   **API Key:** É crucial definir `GEMINI_API_KEY` nas suas variáveis de ambiente para que este provedor funcione. Adicionei um aviso no `main.py` e um fallback para `None` na `AppConfig`.
+    *   **Confiança:** Utiliza a função heurística `_calculate_gemini_confidence` para estimar a qualidade da transcrição, já que a API Gemini não fornece um score direto.
+    *   **Dependências:** Certifique-se de que `google-generativeai` esteja instalado.
+
+3.  **`TranscriptionManager`:**
+    *   O `manager.transcribe_audio(file_path, language)` agora pode receber tanto caminhos para arquivos de áudio quanto de vídeo. Ele passará o caminho para o provedor selecionado, e o `GeminiProvider` decidirá internamente como lidar com o tipo de arquivo.
+    *   A lógica de `FALLBACK_PROVIDERS` em `core/config.py` é crucial para definir a ordem em que os provedores são tentados.
+
+4.  **`core/utils.py`:**
+    *   As funções `get_file_hash` e `get_audio_duration` são utilitários genéricos e são reutilizadas por todos os provedores, o que é um ótimo exemplo de encapsulamento e reutilização.
+
+5.  **Variáveis de Ambiente:** Reforcei a importância de usar variáveis de ambiente para chaves de API (`GEMINI_API_KEY`) e outros segredos.
+
+Agora você tem uma estrutura mais robusta e plugável, permitindo adicionar novos motores de transcrição com facilidade, seguindo a interface `ITranscriptionProvider`! Não se esqueça de instalar todas as dependências (`pip install -r requirements.txt`) e ter o `ffprobe` instalado e acessível no PATH do seu sistema.
+Pergunta: certo,  quero adicionar o codigo no github e conseguir instalar direto de la, o que mais precisa ser incluido no projeto para isso?
+Resposta: Que excelente próximo passo! Publicar seu código no GitHub como uma biblioteca instalável via `pip` (diretamente do repositório) é uma ótima maneira de compartilhar e reutilizar seu trabalho. Isso transforma seu código de um conjunto de scripts em um pacote Python devidamente estruturado.
+
+Para isso, você precisará adicionar alguns arquivos e ajustar a estrutura do seu projeto. Vamos detalhar o que é necessário:
+
+### 1. Estrutura de Pastas Padrão para Pacotes Python
+
+Para que seu projeto seja reconhecido como um pacote instalável, a estrutura de pastas deve ser clara. Vou assumir que a pasta `transcription_library/` (que contém `core/`, `providers/`, `main.py`) será o *diretório raiz do seu repositório Git*.
+
+Dentro desta pasta raiz, você terá:
+
+```
+my_transcription_library_repo/  <- Repositório Git (pasta raiz)
+├── transcription_library/      <- O PACOTE PYTHON REAL (o que será instalado)
+│   ├── __init__.py             <- Marca 'transcription_library' como um pacote
+│   ├── core/
+│   │   ├── __init__.py
+│   │   ├── interfaces.py
+│   │   ├── manager.py
+│   │   ├── config.py
+│   │   └── utils.py
+│   ├── providers/
+│   │   ├── __init__.py
+│   │   ├── distil_whisper_provider.py
+│   │   ├── faster_whisper_provider.py
+│   │   └── gemini_provider.py
+│   └── main.py                 <- Exemplo de uso, pode ser renomeado para 'example.py'
+├── pyproject.toml              <- Configuração do sistema de build (moderno)
+├── README.md                   <- Documentação do projeto
+├── LICENSE                     <- Termos de licença do seu código
+├── requirements.txt            <- Lista de dependências para desenvolvimento/ambiente
+└── .gitignore                  <- Lista de arquivos/pastas a ignorar pelo Git
+```
+
+**Observação sobre `main.py`:** É comum mover o `main.py` (ou `example.py`) para fora da pasta do pacote Python (`transcription_library/`). Isso evita que ele seja instalado como parte da biblioteca e deixa claro que é um script de exemplo/execução, não uma parte central da API da biblioteca. Para a instalação direta do Git via `pip`, ele pode permanecer onde está, mas é uma prática recomendada para pacotes distribuídos no PyPI. Por enquanto, vamos mantê-lo onde está para simplicidade.
+
+### 2. `pyproject.toml` (Configuração de Build - Recomendado)
+
+Este é o arquivo moderno para configurar como seu projeto é construído. Ele define os requisitos de build e os metadados do seu projeto.
+
+**`my_transcription_library_repo/pyproject.toml`**
+
+```toml
+[build-system]
+requires = [\"setuptools>=61.0\"]
+build-backend = \"setuptools.build_meta\"
+
+[project]
+name = \"transcription-library\"
+version = \"0.1.0\" # Comece com 0.1.0 e aumente a cada nova versão ou mudança significativa
+authors = [
+    { name=\"Seu Nome\", email=\"seu.email@example.com\" },
+]
+description = \"A pluggable Python library for audio and video transcription using various AI models (Distil-Whisper, Faster-Whisper, Gemini).\"
+readme = \"README.md\"
+requires-python = \">=3.8\"
+keywords = [\"transcription\", \"audio\", \"video\", \"whisper\", \"gemini\", \"ai\"]
+license = { file=\"LICENSE\" }
+classifiers = [
+    \"Programming Language :: Python :: 3\",
+    \"License :: OSI Approved :: MIT License\", # Ou a licença que você escolher
+    \"Operating System :: OS Independent\",
+    \"Topic :: Scientific/Engineering :: Artificial Intelligence\",
+    \"Topic :: Multimedia :: Sound/Audio :: Speech\",
+    \"Topic :: Multimedia :: Video\",
+]
+
+dependencies = [
+    \"transformers>=4.30.0\",
+    \"torch>=1.12.0\", # A versão exata de torch (CPU/CUDA) é melhor instalada separadamente pelo usuário
+    \"faster-whisper>=0.10.0\",
+    \"google-generativeai>=0.3.0\",
+    \"numba>=0.57.0\",
+    \"tqdm>=4.64.0\",
+    \"mimetypes\", # Já é built-in, mas pode ser listado para clareza
+]
+
+[project.urls]
+\"Homepage\" = \"https://github.com/SeuUsuario/my_transcription_library_repo\" # Substitua pelo seu link
+\"Bug Tracker\" = \"https://github.com/SeuUsuario/my_transcription_library_repo/issues\"
+\"Source\" = \"https://github.com/SeuUsuario/my_transcription_library_repo\"
+
+[tool.setuptools.packages.find]
+where = [\".\"] # Procura pacotes no diretório atual
+```
+
+**Por que `pyproject.toml` é preferível?**
+Ele padroniza a configuração de build para todos os gerenciadores de pacotes Python (`pip`, `build`, etc.) e é o futuro do empacotamento Python.
+
+### 3. `README.md` (Documentação do Projeto)
+
+Este arquivo é essencial para explicar o que seu projeto faz, como instalá-lo e como usá-lo.
+
+**`my_transcription_library_repo/README.md`**
+
+```markdown
+# Biblioteca de Transcrição Pluggável
+
+Uma biblioteca Python flexível para transcrição de áudio e vídeo, projetada para ser modular e extensível. Suporta múltiplos provedores de transcrição, incluindo Distil-Whisper otimizado para PT-BR, Faster-Whisper e Gemini (Google AI).
+
+## Funcionalidades
+
+- **Provedores Pluggáveis:** Troque facilmente entre diferentes modelos de transcrição.
+- **Fallback Inteligente:** Configure uma cadeia de provedores de fallback caso o principal falhe ou retorne baixa confiança.
+- **Cache:** Armazena resultados de transcrição para evitar reprocessamento.
+- **Suporte a Mídia:** Transcrição de arquivos de áudio e vídeo (via Gemini).
+- **Metadados Detalhados:** Retorna texto transcrito, confiança, tempo de processamento e segmentos com timestamp.
+
+## Provedores Suportados
+
+- **Distil-Whisper (PT-BR):** `freds0/distil-whisper-large-v3-ptbr` para alta precisão em Português do Brasil.
+- **Faster-Whisper:** Implementação otimizada do Whisper para desempenho.
+- **Gemini (Google AI):** Suporte para transcrição de áudio e vídeo (incluindo reconhecimento de texto visual).
+
+## Instalação
+
+### Pré-requisitos
+
+1.  **FFmpeg:** Esta biblioteca utiliza `ffprobe` (parte do FFmpeg) para obter a duração de arquivos de áudio/vídeo. Certifique-se de ter o FFmpeg instalado e acessível no PATH do seu sistema.
+    -   [Guia de Instalação do FFmpeg](https://ffmpeg.org/download.html)
+
+2.  **Chave de API Gemini (opcional):** Se você pretende usar o provedor Gemini, precisará de uma chave de API do Google AI Studio. Defina-a como uma variável de ambiente:
+    ```bash
+    export GEMINI_API_KEY=\"SUA_CHAVE_DE_API_GEMINI\"
+    ```
+
+3.  **CUDA (opcional, para GPU):** Para aproveitar a aceleração por GPU com Distil-Whisper e Faster-Whisper, você precisará ter drivers NVIDIA e CUDA Toolkit instalados.
+    -   **PyTorch:** Recomenda-se instalar o PyTorch com suporte a CUDA **antes** de instalar esta biblioteca para garantir a versão correta:
+        ```bash
+        pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121 # ou a sua versão CUDA
+        ```
+        Se você não for usar GPU, instale apenas `pip install torch`.
+
+### Instalação da Biblioteca
+
+Você pode instalar a biblioteca diretamente do repositório GitHub usando `pip`:
+
+```bash
+pip install git+https://github.com/SeuUsuario/my_transcription_library_repo.git
+```
+**Importante:** Substitua `SeuUsuario` e `my_transcription_library_repo.git` pelo seu usuário e nome do repositório no GitHub.
+
+## Como Usar
+
+Aqui está um exemplo básico de como utilizar a biblioteca para transcrever um arquivo de áudio ou vídeo:
+
+```python
+import asyncio
+import logging
+from pathlib import Path
+import os
+
+from transcription_library.core.manager import TranscriptionManager
+from transcription_library.providers.distil_whisper_provider import DistilWhisperProvider
+from transcription_library.providers.faster_whisper_provider import FasterWhisperProvider
+from transcription_library.providers.gemini_provider import GeminiProvider
+from transcription_library.core.config import settings
+
+# Configuração básica de logging
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+async def main():
+    manager = TranscriptionManager()
+
+    # Registrar provedores
+    manager.register_provider(\"distil-whisper-pt\", DistilWhisperProvider())
+    manager.register_provider(\"faster-whisper\", FasterWhisperProvider())
+    manager.register_provider(\"gemini-hybrid\", GeminiProvider())
+
+    # Configure a ordem de preferência e fallback no settings.py ou sobrescreva aqui
+    settings.PRIMARY_PROVIDER = \"distil-whisper-pt\"
+    settings.FALLBACK_PROVIDERS = [\"faster-whisper\", \"gemini-hybrid\"]
+    settings.CONFIDENCE_THRESHOLD = 0.6
+
+    # Exemplo de arquivo de áudio (substitua pelo seu caminho)
+    audio_file = Path(\"path/to/your/audio.mp3\") 
+    # Exemplo de arquivo de vídeo (substitua pelo seu caminho)
+    video_file = Path(\"path/to/your/video.mp4\")
+
+    # Transcrever áudio
+    print(f\"\\n--- Transcrevendo {audio_file.name} ---\")
+    audio_result = await manager.transcribe_audio(audio_file, language=\"pt\")
+    if audio_result.error_message:
+        print(f\"Erro na transcrição de áudio: {audio_result.error_message}\")
+    else:
+        print(f\"Resultado de áudio ({audio_result.model_used}, conf: {audio_result.confidence:.2f}):\\n{audio_result.text[:500]}...\")
+
+    # Transcrever vídeo
+    if settings.GEMINI_API_KEY:
+        print(f\"\\n--- Transcrevendo {video_file.name} ---\")
+        video_result = await manager.transcribe_audio(video_file, language=\"pt-BR\")
+        if video_result.error_message:
+            print(f\"Erro na transcrição de vídeo: {video_result.error_message}\")
+        else:
+            print(f\"Resultado de vídeo ({video_result.model_used}, conf: {video_result.confidence:.2f}):\\n{video_result.text[:500]}...\")
+    else:
+        print(\"\\nChave GEMINI_API_KEY não configurada. Pulando transcrição de vídeo.\")
+
+    await manager.shutdown()
+
+if __name__ == \"__main__\":
+    asyncio.run(main())
+```
+
+## Configuração Avançada
+
+Você pode ajustar as configurações da biblioteca modificando o `transcription_library/core/config.py` ou sobrescrevendo as variáveis da instância `settings` antes de usar o `TranscriptionManager`.
+
+## Contribuição
+
+Sinta-se à vontade para abrir issues ou pull requests se tiver sugestões de melhoria ou encontrar bugs.
+
+## Licença
+
+Este projeto está licenciado sob a [Licença MIT](LICENSE).
+
+```
+
+### 4. `LICENSE` (Arquivo de Licença)
+
+É crucial incluir um arquivo `LICENSE` para informar a outros como eles podem usar seu código. A licença MIT é popular por ser permissiva.
+
+**`my_transcription_library_repo/LICENSE`**
+
+```
+MIT License
+
+Copyright (c) [Ano] [Seu Nome]
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the \"Software\"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+*Substitua `[Ano]` e `[Seu Nome]` conforme apropriado.*
+
+### 5. `requirements.txt` (Dependências de Desenvolvimento/Ambiente)
+
+Embora `pyproject.toml` cuide das dependências de instalação, `requirements.txt` ainda é útil para um ambiente de desenvolvimento ou para usuários que preferem ver todas as dependências em um único lugar.
+
+**`my_transcription_library_repo/requirements.txt`**
+
+```
+transformers
+torch # Usuários devem instalar a versão correta para sua GPU/CPU
+faster-whisper
+google-generativeai
+numba
+tqdm
+```
+*Nota: Mimetypes é parte da biblioteca padrão do Python e não precisa ser listado aqui.*
+
+### 6. `.gitignore` (Arquivos a Ignorar no Git)
+
+Este arquivo informa ao Git quais arquivos e pastas não devem ser versionados.
+
+**`my_transcription_library_repo/.gitignore`**
+
+```
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+.venv/
+venv/
+*.egg
+*.egg-info
+dist/
+build/
+.pytest_cache/
+.coverage
+htmlcov/
+.DS_Store # macOS
+
+# Logs and cache
+*.log
+*.sqlite3
+transcription_cache/ # Cache directory created by the library
+data/ # If you have local test data
+
+# Environment variables
+.env
+.flaskenv
+
+# Editor specific
+.vscode/
+.idea/
+```
+
+### 7. Ajustes no `main.py` (Exemplo de Uso)
+
+Se você decidir mover o `main.py` para a raiz do repositório (fora da pasta `transcription_library`), você precisará ajustar os imports:
+
+**`my_transcription_library_repo/example.py` (se movido)**
+
+```python
+# example.py
+import asyncio
+import logging
+from pathlib import Path
+import os
+import sys
+
+# Adicione o diretório pai ao PATH para que o Python possa encontrar o pacote 'transcription_library'
+sys.path.insert(0, str(Path(__file__).parent)) 
+
+from transcription_library.core.manager import TranscriptionManager
+from transcription_library.providers.distil_whisper_provider import DistilWhisperProvider
+from transcription_library.providers.faster_whisper_provider import FasterWhisperProvider
+from transcription_library.providers.gemini_provider import GeminiProvider
+from transcription_library.core.config import settings
+
+# ... (o restante do código é o mesmo do main.py atualizado)
+```
+Se você mantiver o `main.py` dentro da pasta `transcription_library`, os imports internos (e.g., `from .core.manager import ...`) já funcionarão corretamente.
+
+### Passos para Publicar e Instalar
+
+1.  **Crie a Estrutura:** Organize seus arquivos conforme a estrutura sugerida.
+2.  **Preencha os Arquivos:** Crie e preencha `pyproject.toml`, `README.md`, `LICENSE`, `requirements.txt`, e `.gitignore`.
+3.  **Suba para o GitHub:** Inicie um repositório Git, adicione todos os arquivos e faça o push para o GitHub.
+4.  **Instale (para Teste):** Em um novo ambiente virtual, tente instalar sua biblioteca:
+    ```bash
+    python -m venv .venv
+    source .venv/bin/activate # ou .venv\\Scripts\\activate no Windows
+    
+    # Primeiro, instale o PyTorch (específico para seu hardware)
+    pip install torch # ou pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+    
+    # Em seguida, instale sua biblioteca do GitHub
+    pip install git+https://github.com/SeuUsuario/NomeDoSeuRepositorio.git
+    ```
+5.  **Testar o Exemplo:**
+    ```bash
+    python transcription_library/main.py # se mantiver na pasta do pacote
+    # ou
+    python example.py # se mover para a raiz do repositório
+    ```
+
+Com esses passos, sua biblioteca estará pronta para ser instalada e usada por você e por outros, diretamente do seu repositório no GitHub!
