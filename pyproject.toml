@@ -3,10 +3,10 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "transcription-library"
-version = "0.1.0"
+name = "transcriber"
+version = "1.0.0"
 authors = [
-    { name="Your Name", email="your.email@example.com" },
+    { name="Thiago Oliveira", email="thiagofdso.ufpa@gmail.com" },
 ]
 description = "A pluggable Python library for audio and video transcription using various AI models (Distil-Whisper, Faster-Whisper, Gemini)."
 readme = "README.md"
@@ -32,9 +32,9 @@ dependencies = [
 ]
 
 [project.urls]
-"Homepage" = "https://github.com/YourUsername/transcription-library"
-"Bug Tracker" = "https://github.com/YourUsername/transcription-library/issues"
-"Source" = "https://github.com/YourUsername/transcription-library"
+"Homepage" = "https://github.com/thiagofdso/transcriber"
+"Bug Tracker" = "https://github.com/thiagofdso/transcriber/issues"
+"Source" = "https://github.com/thiagofdso/transcriber"
 
 [tool.setuptools.packages.find]
 where = ["."]
