@@ -3,7 +3,7 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "transcriber"
+name = "transcription_library"
 version = "1.0.0"
 authors = [
     { name="Thiago Oliveira", email="thiagofdso.ufpa@gmail.com" },
@@ -32,9 +32,9 @@ dependencies = [
 ]
 
 [project.urls]
-"Homepage" = "https://github.com/thiagofdso/transcriber"
-"Bug Tracker" = "https://github.com/thiagofdso/transcriber/issues"
-"Source" = "https://github.com/thiagofdso/transcriber"
+"Homepage" = "https://github.com/thiagofdso/transcription_library"
+"Bug Tracker" = "https://github.com/thiagofdso/transcription_library/issues"
+"Source" = "https://github.com/thiagofdso/transcription_library"
 
 [tool.setuptools.packages.find]
 where = ["."]
