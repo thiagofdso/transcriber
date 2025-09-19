@@ -93,12 +93,12 @@ transcription-library/
 
 #### Via GitHub (Recomendado):
 ```bash
-pip install git+https://github.com/thiagofdso/transcriber.git
+pip install git+https://github.com/thiagofdso/transcription_library.git
 ```
 
 #### Para Desenvolvimento:
 ```bash
-git clone https://github.com/thiagofdso/transcriber.git
+git clone https://github.com/thiagofdso/transcription_library.git
 cd transcription-library
 pip install -r requirements.txt
 ```
