@@ -18,7 +18,7 @@ class AppConfig:
 
     # --- Configurações para Gemini (Google AI Studio) ---
     GEMINI_API_KEY: Optional[str] = None
-    GEMINI_MODEL_NAME: str = "gemini-pro" # Ou "gemini-pro-vision" se quiser usar a versão com visão explicitamente
+    GEMINI_MODEL_NAME: str = "gemini-2.5-flash" # Ou "gemini-pro-vision" se quiser usar a versão com visão explicitamente
     GEMINI_VIDEO_TIMEOUT: float = 300.0 # Timeout em segundos para operações de vídeo com Gemini
     MAX_VIDEO_SIZE_MB: int = 200 # Tamanho máximo de vídeo em MB para upload no Gemini
 
@@ -56,7 +56,8 @@ class AppConfig:
         self.DISTIL_WHISPER_CACHE_DIR = os.getenv("DISTIL_WHISPER_CACHE_DIR", self.DISTIL_WHISPER_CACHE_DIR)
         self.FORCE_CPU_FOR_DISTIL_WHISPER = os.getenv("FORCE_CPU_FOR_DISTIL_WHISPER", "false").lower() == "true"
 
-        # Gemini Video
+        # Gemini
+        self.GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", self.GEMINI_MODEL_NAME)
         self.MAX_VIDEO_SIZE_MB = int(os.getenv("MAX_VIDEO_SIZE_MB", str(self.MAX_VIDEO_SIZE_MB)))
         self.GEMINI_VIDEO_TIMEOUT = float(os.getenv("GEMINI_VIDEO_TIMEOUT", str(self.GEMINI_VIDEO_TIMEOUT)))
 
