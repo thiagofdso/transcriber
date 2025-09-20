@@ -39,5 +39,26 @@ class AppConfig:
         self.FFPROBE_PATH = os.getenv("FFPROBE_PATH", self.FFPROBE_PATH)
         self.CUDNN_PATH = os.getenv("CUDNN_PATH", self.CUDNN_PATH)
 
+        # Configurações gerais
+        self.PRIMARY_PROVIDER = os.getenv("PRIMARY_PROVIDER", self.PRIMARY_PROVIDER)
+        self.CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", str(self.CONFIDENCE_THRESHOLD)))
+
+        # Fallback providers (lista separada por vírgulas)
+        fallback_env = os.getenv("FALLBACK_PROVIDERS")
+        if fallback_env:
+            self.FALLBACK_PROVIDERS = [provider.strip() for provider in fallback_env.split(",")]
+
+        # Faster-Whisper
+        self.FASTER_WHISPER_MODEL_SIZE = os.getenv("FASTER_WHISPER_MODEL_SIZE", self.FASTER_WHISPER_MODEL_SIZE)
+        self.FASTER_WHISPER_FORCE_CPU = os.getenv("FASTER_WHISPER_FORCE_CPU", "false").lower() == "true"
+
+        # Distil-Whisper
+        self.DISTIL_WHISPER_CACHE_DIR = os.getenv("DISTIL_WHISPER_CACHE_DIR", self.DISTIL_WHISPER_CACHE_DIR)
+        self.FORCE_CPU_FOR_DISTIL_WHISPER = os.getenv("FORCE_CPU_FOR_DISTIL_WHISPER", "false").lower() == "true"
+
+        # Gemini Video
+        self.MAX_VIDEO_SIZE_MB = int(os.getenv("MAX_VIDEO_SIZE_MB", str(self.MAX_VIDEO_SIZE_MB)))
+        self.GEMINI_VIDEO_TIMEOUT = float(os.getenv("GEMINI_VIDEO_TIMEOUT", str(self.GEMINI_VIDEO_TIMEOUT)))
+
 # Instância de configuração global
 settings = AppConfig()

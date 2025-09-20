@@ -1,0 +1,32 @@
+# Transcription Library Configuration
+# Uses pluggable transcription library with multiple providers and intelligent fallback
+# Available providers: distil-whisper-pt (PT-BR optimized), faster-whisper, gemini-hybrid
+PRIMARY_PROVIDER=distil-whisper-pt
+# Fallback providers in order (comma-separated)
+#FALLBACK_PROVIDERS=faster-whisper,gemini-hybrid
+# Minimum confidence to accept result (0.0-1.0)
+CONFIDENCE_THRESHOLD=0.7
+
+# Faster-Whisper Configuration
+# Model size: tiny, base, small, medium, large-v2, large-v3
+FASTER_WHISPER_MODEL_SIZE=medium
+# Force CPU usage even if GPU available
+#FASTER_WHISPER_FORCE_CPU=false
+
+# Distil-Whisper Configuration (PT-BR optimized)
+# Cache directory for downloaded models
+DISTIL_WHISPER_CACHE_DIR=./models/cache
+# Force CPU usage even if GPU available
+FORCE_CPU_FOR_DISTIL_WHISPER=false
+
+# Gemini Video Configuration
+# Maximum video file size in MB
+MAX_VIDEO_SIZE_MB=1000
+# Timeout for video processing in seconds
+GEMINI_VIDEO_TIMEOUT=300
+
+# FFmpeg Configuration (Optional - auto-detected)
+# Path to ffprobe binary (leave empty for auto-detection)
+FFPROBE_PATH=/usr/bin/ffprobe
+# Path to CUDA libraries (for GPU acceleration)
+CUDNN_PATH=C:\Program Files\NVIDIA\CUDNN\v9.10
